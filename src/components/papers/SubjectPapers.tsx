@@ -27,6 +27,7 @@ import { Paper } from "@/types/paper";
 import FadeIn from "@/components/animations/FadeIn";
 import { toast } from "sonner";
 import PDFViewer from "@/components/pdf/PDFViewer";
+import BatchProgressBar from "@/components/papers/BatchProgressBar";
 import { AnimatePresence } from "framer-motion";
 
 const SubjectPapersView = () => {
@@ -37,7 +38,10 @@ const SubjectPapersView = () => {
   const selectedSubject = searchParams.get("subject");
   const [previewPaper, setPreviewPaper] = useState<Paper | null>(null);
   const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
-  const [downloadingFile, setDownloadingFile] = useState<string | null>(null);
+  const [activeDownloads, setActiveDownloads] = useState<Set<string>>(new Set());
+  // Synchronous guard to prevent race conditions on rapid clicks
+  const activeDownloadsRef = useRef<Set<string>>(new Set());
+  const batchCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [selectedPapers, setSelectedPapers] = useState<Record<string, boolean>>(
     {}
@@ -270,13 +274,22 @@ const SubjectPapersView = () => {
   };
 
   const handleDownload = async (paper: Paper) => {
-    if (downloadingFile || isServerDown) {
-      if (isServerDown) {
-        toast.error("Paper storage is currently unreachable. Please try again later.");
-      }
+    if (isServerDown) {
+      toast.error("Paper storage is currently unreachable. Please try again later.");
       return;
     }
-    setDownloadingFile(paper.fileName);
+
+    // Synchronous check-and-add using ref to prevent race conditions
+    if (activeDownloadsRef.current.has(paper.url)) {
+      return; // Already downloading
+    }
+
+    // Atomically add to ref
+    activeDownloadsRef.current.add(paper.url);
+    
+    // Update state to sync with ref
+    setActiveDownloads(new Set(activeDownloadsRef.current));
+
     try {
       const success = await downloadFile(paper.url, paper.fileName, paper);
       if (!success) {
@@ -286,7 +299,11 @@ const SubjectPapersView = () => {
       console.error("Download failed:", error);
       recordFailure();
     } finally {
-      setDownloadingFile(null);
+      // Remove from ref
+      activeDownloadsRef.current.delete(paper.url);
+      
+      // Update state to sync with ref
+      setActiveDownloads(new Set(activeDownloadsRef.current));
     }
   };
 
@@ -423,14 +440,14 @@ const SubjectPapersView = () => {
                     e.stopPropagation();
                     handleDownload(paper);
                   }}
-                  disabled={downloadingFile === paper.fileName || isServerDown}
+                  disabled={activeDownloads.has(paper.url) || isServerDown}
                   className="flex-1 flex items-center justify-center gap-2 bg-brand text-white rounded-lg px-3 py-2 text-sm font-medium transition-colors duration-200 hover:bg-brand/90 focus:outline-none focus:ring-2 focus:ring-brand/50 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <Download
                     size={16}
                     weight="duotone"
                     className={
-                      downloadingFile === paper.fileName ? "animate-spin" : ""
+                      activeDownloads.has(paper.url) ? "animate-spin" : ""
                     }
                   />
                   <span>Download</span>
@@ -524,14 +541,14 @@ const SubjectPapersView = () => {
                     e.stopPropagation();
                     handleDownload(paper);
                   }}
-                  disabled={downloadingFile === paper.fileName || isServerDown}
+                  disabled={activeDownloads.has(paper.url) || isServerDown}
                   className="flex items-center gap-2 bg-brand text-white rounded-lg px-3 py-2 text-sm font-medium transition-colors duration-200 hover:bg-brand/90 focus:outline-none focus:ring-2 focus:ring-brand/50 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <Download
                     size={16}
                     weight="duotone"
                     className={
-                      downloadingFile === paper.fileName ? "animate-spin" : ""
+                      activeDownloads.has(paper.url) ? "animate-spin" : ""
                     }
                   />
                   <span className="hidden sm:inline">Download</span>
@@ -731,111 +748,36 @@ const SubjectPapersView = () => {
   const renderBatchDownloadProgress = () => {
     if (!batchDownloadProgress) return null;
 
-    const getStatusText = () => {
-      switch (batchDownloadProgress.status) {
-        case "preparing":
-          return "Preparing download...";
-        case "downloading":
-          return `Downloading ${batchDownloadProgress.completed || 0} of ${
-            batchDownloadProgress.totalPapers
-          } papers...`;
-        case "processing":
-          return "Creating ZIP file...";
-        case "sending":
-          return "Sending to your browser...";
-        case "complete":
-          return "Download complete!";
-        case "error":
-          return batchDownloadProgress.error || "Download failed";
-        default:
-          return "Processing...";
-      }
-    };
-
-    const getProgressPercentage = () => {
-      if (batchDownloadProgress.percentage !== undefined) {
-        return batchDownloadProgress.percentage;
-      }
-
-      // Fallback percentages
-      if (batchDownloadProgress.status === "complete") return 100;
-      if (batchDownloadProgress.status === "error") return 0;
-      if (batchDownloadProgress.status === "preparing") return 5;
-      if (batchDownloadProgress.status === "downloading") return 30;
-      if (batchDownloadProgress.status === "processing") return 70;
-      if (batchDownloadProgress.status === "sending") return 90;
-      return 0;
-    };
-
-    const getDetailText = () => {
-      if (batchDownloadProgress.currentPaper) {
-        return batchDownloadProgress.currentPaper;
-      }
-
-      if (batchDownloadProgress.status === "complete") {
-        return `Successfully downloaded ${batchDownloadProgress.totalPapers} papers`;
-      }
-      if (batchDownloadProgress.status === "error") {
-        return batchDownloadProgress.error &&
-          batchDownloadProgress.error.includes("Failed to connect")
-          ? "Check your network connection and try again"
-          : "";
-      }
-
-      if (batchDownloadProgress.status === "downloading") {
-        const percent = getProgressPercentage();
-        return `${percent.toFixed(0)}%`;
-      }
-
-      if (batchDownloadProgress.status === "processing") {
-        return "Compressing files into ZIP archive";
-      }
-
-      if (batchDownloadProgress.status === "sending") {
-        return "Starting browser download";
-      }
-
-      const percentage = getProgressPercentage();
-      return `${percentage.toFixed(0)}% complete`;
-    };
-
     return (
-      <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-        <div className="bg-secondary rounded-xl p-6 max-w-md w-full">
-          <div className="flex justify-between items-center mb-4">
-            <h3 className="text-lg font-semibold text-content">
-              {batchDownloadProgress.status === "complete"
-                ? "Download Complete"
-                : "Downloading Papers"}
-            </h3>
+      <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div className="bg-secondary rounded-2xl p-6 sm:p-8 max-w-lg w-full shadow-2xl border border-primary/20">
+          <div className="flex justify-between items-start mb-4 sm:mb-6">
+            <div className="flex-1 min-w-0">
+              <h3 className="text-lg sm:text-xl font-bold text-content mb-1 truncate">
+                {batchDownloadProgress.status === "complete"
+                  ? "Download Complete"
+                  : batchDownloadProgress.status === "error"
+                  ? "Download Failed"
+                  : "Batch Download"}
+              </h3>
+              <p className="text-xs sm:text-sm text-content/60">
+                {batchDownloadProgress.totalPapers} papers selected
+                {batchDownloadProgress.failedCount ? ` • ${batchDownloadProgress.failedCount} failed` : ''}
+              </p>
+            </div>
             {(batchDownloadProgress.status === "complete" ||
               batchDownloadProgress.status === "error") && (
               <button
-                onClick={() => setBatchDownloadProgress(null)}
-                className="text-content/60 hover:text-content"
+                onClick={closeBatchDownloadProgress}
+                className="text-content/60 hover:text-content transition-colors p-1 ml-2 flex-shrink-0"
                 aria-label="Close"
               >
-                <X size={20} weight="bold" />
+                <X size={20} weight="bold" className="sm:w-6 sm:h-6" />
               </button>
             )}
           </div>
 
-          <div className="mb-4">
-            <div className="h-2 bg-primary/30 rounded-full overflow-hidden">
-              <div
-                className={`h-full ${
-                  batchDownloadProgress.status === "error"
-                    ? "bg-red-500"
-                    : "bg-brand"
-                } transition-all duration-300`}
-                style={{ width: `${getProgressPercentage()}%` }}
-              ></div>
-            </div>
-            <div className="mt-1 flex justify-between text-xs text-content/70">
-              <span>{getStatusText()}</span>
-              <span>{getDetailText()}</span>
-            </div>
-          </div>
+          <BatchProgressBar progress={batchDownloadProgress} />
 
           {batchDownloadProgress.status === "error" && (
             <div className="mt-4 text-center">
@@ -843,42 +785,7 @@ const SubjectPapersView = () => {
                 {batchDownloadProgress.error}
               </p>
               <button
-                onClick={() => {
-                  // Directly restart the batch download with the same papers
-                  setBatchDownloadProgress({
-                    totalPapers: selectedPapersArray.length,
-                    completed: 0,
-                    status: "preparing",
-                    percentage: 0,
-                  });
-
-                  // Small delay to show the preparing state before starting
-                  setTimeout(() => {
-                    batchDownloadPapers(
-                      selectedPapersArray,
-                      filters,
-                      (progress) => {
-                        setBatchDownloadProgress(progress);
-
-                        if (
-                          progress.status === "complete" ||
-                          progress.status === "error"
-                        ) {
-                          const timeoutDuration =
-                            progress.status === "error" ? 3000 : 1000;
-                          setTimeout(() => {
-                            setBatchDownloadProgress(null);
-
-                            if (progress.status === "complete") {
-                              setIsSelectMode(false);
-                              setSelectedPapers({});
-                            }
-                          }, timeoutDuration);
-                        }
-                      }
-                    );
-                  }, 300);
-                }}
+                onClick={runBatchDownload}
                 className="bg-brand text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors duration-200 hover:bg-brand/90 focus:outline-none"
               >
                 Try Again
@@ -888,6 +795,47 @@ const SubjectPapersView = () => {
         </div>
       </div>
     );
+  };
+
+  const clearBatchCloseTimer = () => {
+    if (batchCloseTimerRef.current !== null) {
+      clearTimeout(batchCloseTimerRef.current);
+      batchCloseTimerRef.current = null;
+    }
+  };
+
+  const closeBatchDownloadProgress = () => {
+    clearBatchCloseTimer();
+    setBatchDownloadProgress(null);
+  };
+
+  const runBatchDownload = async () => {
+    clearBatchCloseTimer();
+
+    setBatchDownloadProgress({
+      totalPapers: selectedPapersArray.length,
+      completed: 0,
+      status: "preparing",
+      percentage: 0,
+      failedCount: 0,
+    });
+
+    await batchDownloadPapers(selectedPapersArray, filters, (progress) => {
+      setBatchDownloadProgress(progress);
+
+      if (progress.status === "complete" || progress.status === "error") {
+        const timeoutDuration = progress.status === "error" ? 3000 : 1000;
+        batchCloseTimerRef.current = setTimeout(() => {
+          batchCloseTimerRef.current = null;
+          setBatchDownloadProgress(null);
+
+          if (progress.status === "complete") {
+            setIsSelectMode(false);
+            setSelectedPapers({});
+          }
+        }, timeoutDuration);
+      }
+    });
   };
 
   const handleBatchDownload = async () => {
@@ -923,32 +871,7 @@ const SubjectPapersView = () => {
       return;
     }
 
-    // Reset any previous progress for batch downloads
-    setBatchDownloadProgress({
-      totalPapers: selectedPapersArray.length,
-      completed: 0,
-      status: "preparing",
-      percentage: 0,
-    });
-
-    // Attempt the batch download with filter information
-    await batchDownloadPapers(selectedPapersArray, filters, (progress) => {
-      setBatchDownloadProgress(progress);
-
-      // If complete or error, clear progress after a delay
-      if (progress.status === "complete" || progress.status === "error") {
-        const timeoutDuration = progress.status === "error" ? 3000 : 1000;
-        setTimeout(() => {
-          setBatchDownloadProgress(null);
-
-          // If download was successful, exit select mode
-          if (progress.status === "complete") {
-            setIsSelectMode(false);
-            setSelectedPapers({});
-          }
-        }, timeoutDuration);
-      }
-    });
+    await runBatchDownload();
   };
 
   return (

@@ -76,6 +76,15 @@ export interface BatchDownloadProgress {
   currentPaper?: string;
   error?: string;
   percentage?: number;
+  failedCount?: number;
+}
+
+const DOWNLOAD_START = 5;
+const DOWNLOAD_END = 85;
+const ZIP_END = 95;
+
+function downloadPercentage(done: number, total: number): number {
+  return DOWNLOAD_START + (done / total) * (DOWNLOAD_END - DOWNLOAD_START);
 }
 
 export type ProgressCallback = (progress: BatchDownloadProgress) => void;
@@ -149,13 +158,14 @@ export async function batchDownloadPapers(
       totalPapers: uniquePapers.length,
       completed: 0,
       status: 'preparing',
-      percentage: 0
+      percentage: 0,
+      failedCount: 0
     };
 
     onProgress?.({ ...progress });
 
     // Check cache for each paper first
-    const cachedPapers: Paper[] = [];
+    const cachedPapers: Array<{ paper: Paper; pdfData: ArrayBuffer }> = [];
     const uncachedPapers: Paper[] = [];
 
     progress.status = 'preparing';
@@ -178,7 +188,7 @@ export async function batchDownloadPapers(
 
       const cachedData = await cacheManager.getPdf(paper.url);
       if (cachedData) {
-        cachedPapers.push(paper);
+        cachedPapers.push({ paper, pdfData: cachedData });
       } else {
         uncachedPapers.push(paper);
       }
@@ -190,50 +200,17 @@ export async function batchDownloadPapers(
     // Transition to downloading phase
     await new Promise(resolve => setTimeout(resolve, 400));
     progress.status = 'downloading';
-    progress.percentage = 5;
+    progress.percentage = DOWNLOAD_START;
     progress.completed = 0;
 
     if (cacheHitCount > 0 && networkFetchCount > 0) {
-      progress.currentPaper = `Using ${cacheHitCount} cached papers, fetching ${networkFetchCount} more...`;
+      progress.currentPaper = `${cacheHitCount} cached • ${networkFetchCount} to download`;
     } else if (cacheHitCount > 0) {
-      progress.currentPaper = 'All papers found in cache...';
+      progress.currentPaper = `${cacheHitCount} papers from cache`;
     } else {
-      progress.currentPaper = `Fetching ${networkFetchCount} papers...`;
+      progress.currentPaper = `${networkFetchCount} papers to download`;
     }
 
-    onProgress?.({ ...progress });
-
-    // Progress simulation for downloading phase
-    const downloadSteps = 8;
-    const baseCompleted = cacheHitCount; // Cached papers are "instantly" available
-
-    for (let i = 0; i < downloadSteps; i++) {
-      await new Promise(resolve => setTimeout(resolve, 100 + Math.random() * 150));
-
-      const networkProgress = Math.min(networkFetchCount, (i + 1) * Math.ceil(networkFetchCount / downloadSteps));
-      const newCompleted = baseCompleted + networkProgress;
-      progress.completed = newCompleted;
-      progress.percentage = 5 + Math.round((newCompleted / uniquePapers.length) * 35);
-
-      if (i < downloadSteps / 2) {
-        if (cacheHitCount > 0 && networkFetchCount > 0) {
-          const networkDownloaded = newCompleted - baseCompleted;
-          progress.currentPaper = `Downloaded ${networkDownloaded}/${networkFetchCount} new papers (${cacheHitCount} from cache)`;
-        } else {
-          progress.currentPaper = `Collecting files (${progress.completed} of ${uniquePapers.length})...`;
-        }
-      } else {
-        progress.currentPaper = `Preparing batch (${progress.completed} of ${uniquePapers.length})...`;
-      }
-
-      onProgress?.({ ...progress }); // Create new object for React re-render
-    }
-
-    // Actually fetch the papers now
-    progress.percentage = 40;
-    progress.currentPaper = networkFetchCount > 0
-      ? 'Processing files...'
-      : 'Processing cached files...';
     onProgress?.({ ...progress });
 
     let successCount = 0;
@@ -241,48 +218,39 @@ export async function batchDownloadPapers(
 
     // Process cached papers first (instant)
     for (let i = 0; i < cachedPapers.length; i++) {
-      const paper = cachedPapers[i];
+      const { paper, pdfData } = cachedPapers[i];
       try {
-        // Update progress for cached papers
-        progress.percentage = 40 + Math.round((i / uniquePapers.length) * 10);
-        progress.currentPaper = `Processing ${paper.fileName} (cached)...`;
-        onProgress?.({ ...progress });
-
-        const pdfData = await cacheManager.getPdf(paper.url);
-        if (pdfData) {
-          let fileName = paper.fileName;
-          if (!fileName.toLowerCase().endsWith('.pdf')) {
-            fileName += '.pdf';
-          }
-
-
-
-          zip.file(fileName, pdfData);
-          successCount++;
+        let fileName = paper.fileName;
+        if (!fileName.toLowerCase().endsWith('.pdf')) {
+          fileName += '.pdf';
         }
+
+        zip.file(fileName, pdfData);
+        successCount++;
       } catch (error) {
         console.error(`Error processing cached ${paper.fileName}:`, error);
         errorCount++;
+        progress.failedCount = errorCount;
       }
+
+      progress.completed = i + 1;
+      progress.percentage = downloadPercentage(progress.completed, uniquePapers.length);
+      progress.currentPaper = `Downloading ${i + 1} of ${uniquePapers.length}`;
+      onProgress?.({ ...progress });
     }
 
     // Process uncached papers
     for (let i = 0; i < uncachedPapers.length; i++) {
       const paper = uncachedPapers[i];
       try {
-        // Update progress for uncached papers
-        const overallProgress = cachedPapers.length + i;
-        progress.percentage = 40 + Math.round((overallProgress / uniquePapers.length) * 10);
-        progress.currentPaper = `Downloading ${paper.fileName}...`;
+        progress.currentPaper = `Downloading ${cachedPapers.length + i + 1} of ${uniquePapers.length}`;
         onProgress?.({ ...progress });
 
         // Fetch with timeout
         const response = await fetchWithTimeout(paper.url);
 
         if (!response.ok) {
-          console.error(`Failed to fetch ${paper.url}, status: ${response.status}`);
-          errorCount++;
-          continue;
+          throw new Error(`status ${response.status}`);
         }
 
         const pdfData = await response.arrayBuffer();
@@ -308,11 +276,15 @@ export async function batchDownloadPapers(
 
         zip.file(fileName, pdfData);
         successCount++;
-
       } catch (error) {
         console.error(`Error processing ${paper.fileName}:`, error);
         errorCount++;
+        progress.failedCount = errorCount;
       }
+
+      progress.completed = cachedPapers.length + i + 1;
+      progress.percentage = downloadPercentage(progress.completed, uniquePapers.length);
+      onProgress?.({ ...progress });
     }
 
     if (successCount === 0) {
@@ -327,64 +299,36 @@ export async function batchDownloadPapers(
     // ZIP creation phase
     progress.completed = uniquePapers.length;
     progress.status = 'processing';
-    progress.percentage = 50;
-    progress.currentPaper = `Creating ZIP file with ${successCount} papers`;
-    if (cacheHitCount > 0) {
-      progress.currentPaper += ` (${cacheHitCount} from cache)`;
-    }
-    if (errorCount > 0) {
-      progress.currentPaper += ` (${errorCount} failed)`;
-    }
+    progress.percentage = DOWNLOAD_END;
+    progress.currentPaper = `Compressing ${successCount} papers`;
+    progress.failedCount = errorCount;
     onProgress?.({ ...progress });
 
-    // Simulate ZIP creation time with smooth progress
-    const zipCreationTime = Math.min(2000, Math.max(800, uniquePapers.length * 40));
-    const zipStartTime = Date.now();
-
-    const zipUpdateInterval = setInterval(() => {
-      const elapsed = Date.now() - zipStartTime;
-      if (elapsed >= zipCreationTime) {
-        clearInterval(zipUpdateInterval);
-        return;
+    let lastZipUpdate = 0;
+    const zipBlob = await zip.generateAsync(
+      { type: 'blob', compression: 'STORE' },
+      ({ percent }) => {
+        const now = Date.now();
+        if (now - lastZipUpdate < 150 && percent < 100) return;
+        lastZipUpdate = now;
+        progress.percentage = DOWNLOAD_END + (percent / 100) * (ZIP_END - DOWNLOAD_END);
+        onProgress?.({ ...progress });
       }
-
-      const progressPercent = 50 + Math.min(30, Math.round((elapsed / zipCreationTime) * 30));
-      progress.percentage = progressPercent;
-      onProgress?.({ ...progress });
-    }, 120);
-
-    const zipBlob = await zip.generateAsync({
-      type: 'blob',
-      compression: 'DEFLATE',
-      compressionOptions: {
-        level: 9
-      }
-    });
-
-    clearInterval(zipUpdateInterval);
-
-    // Ensure minimum time for smooth UX
-    const actualZipTime = Date.now() - zipStartTime;
-    if (actualZipTime < zipCreationTime) {
-      const remainingTime = zipCreationTime - actualZipTime;
-      progress.percentage = 80;
-      onProgress?.({ ...progress });
-      await new Promise(resolve => setTimeout(resolve, remainingTime));
-    }
+    );
 
     // Sending phase
     progress.status = 'sending';
-    progress.percentage = 90;
-    progress.currentPaper = 'Preparing download...';
+    progress.percentage = ZIP_END;
+    progress.currentPaper = 'Preparing download';
     onProgress?.({ ...progress });
 
     const zipFileName = formatZipFilename(uniquePapers, filters);
     const objectUrl = URL.createObjectURL(zipBlob);
 
-    await new Promise(resolve => setTimeout(resolve, 400));
+    await new Promise(resolve => setTimeout(resolve, 300));
 
-    progress.percentage = 95;
-    progress.currentPaper = 'Starting download...';
+    progress.percentage = 98;
+    progress.currentPaper = 'Starting download';
     onProgress?.({ ...progress });
 
     // Create download link
@@ -399,14 +343,9 @@ export async function batchDownloadPapers(
     progress.status = 'complete';
     progress.percentage = 100;
 
-    let completionMessage = `Downloaded ${successCount} papers successfully`;
-    if (cacheHitCount > 0 && networkFetchCount > 0) {
-      completionMessage += ` (${cacheHitCount} from cache, ${networkFetchCount} from network)`;
-    } else if (cacheHitCount > 0) {
-      completionMessage += ` (all from cache)`;
-    }
+    let completionMessage = `${successCount} papers downloaded`;
     if (errorCount > 0) {
-      completionMessage += ` (${errorCount} failed)`;
+      completionMessage += ` • ${errorCount} failed`;
     }
 
     progress.currentPaper = completionMessage;

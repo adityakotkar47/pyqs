@@ -98,6 +98,8 @@ export function PaperProvider({ children }: PaperProviderProps) {
   const fetchPapersData = useCallback(async (force = false) => {
     if (isLoading) return;
 
+    let toastId: string | number | undefined = undefined;
+
     try {
       setIsLoading(true);
 
@@ -132,7 +134,7 @@ export function PaperProvider({ children }: PaperProviderProps) {
       }
 
       if (force) {
-        toast.loading('Refreshing papers...');
+        toastId = toast.loading('Refreshing papers...');
       }
 
       const query = new URLSearchParams();
@@ -176,7 +178,7 @@ export function PaperProvider({ children }: PaperProviderProps) {
       }
 
       if (force) {
-        toast.success('Papers refreshed successfully');
+        toast.success('Papers refreshed successfully', { id: toastId });
       }
 
       setLoadingStatus(LoadingStatus.COMPLETE);
@@ -186,7 +188,7 @@ export function PaperProvider({ children }: PaperProviderProps) {
       console.error('Failed to fetch papers data:', error);
       setError(error instanceof Error ? error : new Error('Unknown error'));
       setLoadingStatus(LoadingStatus.ERROR);
-      toast.error(error instanceof Error ? error.message : 'Failed to fetch papers data');
+      toast.error(error instanceof Error ? error.message : 'Failed to fetch papers data', { id: toastId });
     } finally {
       setIsLoading(false);
     }
